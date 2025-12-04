@@ -1,0 +1,15 @@
+#ifndef AGVCOREMOTION_CONFIG_H
+#define AGVCOREMOTION_CONFIG_H
+
+// Default configuration values
+#define DEFAULT_WHEEL_DIAMETER_MM   200.0
+#define DEFAULT_WHEEL_BASE_MM       600.0
+#define DEFAULT_BASE_SPEED          65.0
+#define DEFAULT_TURN_SPEED          50.0
+#define DEFAULT_FINAL_SPEED         5.0
+#define DEFAULT_LINEAR_CALIBRATION  0.895
+#define DEFAULT_TURN_CALIBRATION    0.55
+#define DEFAULT_LEFT_MOTOR_TRIM     1.00
+#define DEFAULT_RIGHT_MOTOR_TRIM    1.00
+
+#endif
