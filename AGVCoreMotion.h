@@ -55,6 +55,9 @@ public:
   // Path execution (from web interface)
   void executePath(int sourceX, int sourceY, int destX, int destY, bool loopMode = false, int loopCount = 1);
   
+  // Process command from Core 0 - NOW PUBLIC
+  void processCommand(const char* cmd, uint8_t source, uint8_t priority);
+  
   // Library handles everything else automatically on Core 1
   void loop(); // Called automatically in background task
 
@@ -139,8 +142,7 @@ private:
   void updateTurnMovement();
   void executePathSegment();
   
-  // Command processing
-  void processCommand(const char* cmd, uint8_t source, uint8_t priority);
+  // Command processing (internal helpers)
   bool isValidMovementCommand(const char* cmd);
   void parseAndExecuteCommand(const char* cmd);
 };
