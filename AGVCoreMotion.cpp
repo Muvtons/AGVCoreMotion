@@ -1,5 +1,5 @@
 #include "AGVCoreMotion.h"
-#include "AGVCoreMotion_Config.h"
+#include <Arduino.h>
 
 using namespace AGVCoreMotionLib;
 
@@ -14,11 +14,28 @@ void IRAM_ATTR AGVCoreMotion::isrRightWrapper() {
   agvMotion.isrRight();
 }
 
-void AGVCoreMotion::begin() {
+void AGVCoreMotion::begin(uint8_t spdLeftPin, uint8_t spdRightPin,
+                         uint8_t pwmLeftPin, uint8_t pwmRightPin,
+                         uint8_t dirLeftPin, uint8_t dirRightPin,
+                         uint8_t brkLeftPin, uint8_t brkRightPin) {
   Serial.println("\n[AGVMOTION] Initializing AGV Core Motion System...");
+  
+  // Store pin configuration
+  SPD_L = spdLeftPin;
+  SPD_R = spdRightPin;
+  PWM_L = pwmLeftPin;
+  PWM_R = pwmRightPin;
+  DIR_L = dirLeftPin;
+  DIR_R = dirRightPin;
+  BRK_L = brkLeftPin;
+  BRK_R = brkRightPin;
   
   // Initialize mutex for thread safety
   motionMutex = xSemaphoreCreateMutex();
+  if (!motionMutex) {
+    Serial.println("[ERROR] Failed to create motion mutex!");
+    return;
+  }
   
   // Set default configuration
   WHEEL_DIAMETER_MM = 200.0;
@@ -35,7 +52,7 @@ void AGVCoreMotion::begin() {
   initHardware();
   
   // Start Core 1 task (handles all motor control)
-  xTaskCreatePinnedToCore(
+  if (xTaskCreatePinnedToCore(
     [](void* param) {
       AGVCoreMotion* motion = (AGVCoreMotion*)param;
       motion->core1Task(NULL);
@@ -43,14 +60,484 @@ void AGVCoreMotion::begin() {
     "AGVMotionCore1",
     8192,  // Stack size
     this,
-    1,     // Priority
+    configMAX_PRIORITIES - 1,     // High priority
     &core1TaskHandle,
     1      // Core 1
-  );
+  ) != pdPASS) {
+    Serial.println("[ERROR] Failed to create Core 1 task!");
+  }
   
   Serial.println("[AGVMOTION] ✅ Motion System started on Core 1");
+  Serial.println("[AGVMOTION] ✅ Ready for serial commands");
+  Serial.println("[AGVMOTION] Supported commands:");
+  Serial.println("  move forward");
+  Serial.println("  turn_left [degrees]");
+  Serial.println("  turn_right [degrees]");
+  Serial.println("  turnaround");
+  Serial.println("  STOP (emergency)");
+  Serial.println("  CLEAR_EMERGENCY");
 }
 
+void AGVCoreMotion::initHardware() {
+  // Initialize pins with error checking
+  pinMode(SPD_L, INPUT_PULLUP);
+  pinMode(SPD_R, INPUT_PULLUP);
+  pinMode(DIR_L, OUTPUT);
+  pinMode(DIR_R, OUTPUT);
+  pinMode(BRK_L, OUTPUT);
+  pinMode(BRK_R, OUTPUT);
+  
+  // Initial safe state
+  digitalWrite(BRK_L, HIGH);
+  digitalWrite(BRK_R, HIGH);
+  digitalWrite(DIR_L, LOW);
+  digitalWrite(DIR_R, LOW);
+  
+  // Attach interrupts
+  attachInterrupt(digitalPinToInterrupt(SPD_L), isrLeftWrapper, RISING);
+  attachInterrupt(digitalPinToInterrupt(SPD_R), isrRightWrapper, RISING);
+  
+  // Setup PWM
+  setupPWM();
+  
+  Serial.println("[AGVMOTION] ✅ Hardware initialized");
+}
+
+void AGVCoreMotion::setupPWM() {
+  ledc_timer_config_t timer = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .duty_resolution = LEDC_TIMER_12_BIT,
+    .timer_num = LEDC_TIMER_0,
+    .freq_hz = 20000,  // 20kHz for quieter operation
+    .clk_cfg = LEDC_AUTO_CLK
+  };
+  
+  if (ledc_timer_config(&timer) != ESP_OK) {
+    Serial.println("[ERROR] PWM timer configuration failed!");
+    return;
+  }
+
+  ledc_channel_config_t ch = {
+    .gpio_num = PWM_L, 
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .channel = LEDC_CHANNEL_0, 
+    .intr_type = LEDC_INTR_DISABLE,
+    .timer_sel = LEDC_TIMER_0, 
+    .duty = 0, 
+    .hpoint = 0
+  };
+  
+  if (ledc_channel_config(&ch) != ESP_OK) {
+    Serial.println("[ERROR] Left PWM channel configuration failed!");
+  }
+
+  ch.gpio_num = PWM_R;
+  ch.channel = LEDC_CHANNEL_1;
+  if (ledc_channel_config(&ch) != ESP_OK) {
+    Serial.println("[ERROR] Right PWM channel configuration failed!");
+  }
+  
+  Serial.println("[AGVMOTION] ✅ PWM configured at 20kHz");
+}
+
+void AGVCoreMotion::core1Task(void *parameter) {
+  Serial.println("[CORE1] AGV Motion task started on Core 1");
+  
+  while(1) {
+    if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(20)) == pdPASS) {
+      // Only process movement if not in emergency state
+      if (currentState != EMERGENCY_STOP) {
+        switch(currentState) {
+          case FORWARD_MOVING:
+          case FORWARD_SLOWING:
+            updateForwardMovement();
+            break;
+            
+          case TURN_MOVING:
+          case TURN_SLOWING:
+            updateTurnMovement();
+            break;
+            
+          default:
+            break;
+        }
+      }
+      xSemaphoreGive(motionMutex);
+    }
+    
+    delay(5);  // Small delay for responsiveness
+  }
+}
+
+// Motor control methods
+void AGVCoreMotion::setMotorSpeeds(float left, float right) {
+  // Apply safety limits
+  left = constrain(left, 0, 100);
+  right = constrain(right, 0, 100);
+  
+  // Convert to 12-bit duty cycle (0-4095)
+  uint32_t leftDuty = (uint32_t)(left / 100.0f * 4095.0f);
+  uint32_t rightDuty = (uint32_t)(right / 100.0f * 4095.0f);
+  
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, leftDuty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, rightDuty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
+
+void AGVCoreMotion::stopRobot() {
+  digitalWrite(BRK_L, HIGH);
+  digitalWrite(BRK_R, HIGH);
+  setMotorSpeeds(0, 0);
+}
+
+void AGVCoreMotion::setDirection(bool forward) {
+  digitalWrite(BRK_L, LOW);
+  digitalWrite(BRK_R, LOW);
+  digitalWrite(DIR_L, forward ? HIGH : LOW);
+  digitalWrite(DIR_R, forward ? HIGH : LOW);
+}
+
+void AGVCoreMotion::resetEncoders() {
+  noInterrupts();
+  encL = 0;
+  encR = 0;
+  interrupts();
+}
+
+// Calculation methods
+long AGVCoreMotion::calculateDistancePulses(float mm) {
+  // Pulses per revolution = 24 (encoder) * 30 (gear ratio)
+  // Distance per revolution = PI * wheel diameter
+  // Calibration factor accounts for slippage and mechanical tolerances
+  return (long)((mm / (PI * WHEEL_DIAMETER_MM)) * (24 * 30) * LINEAR_CALIBRATION);
+}
+
+long AGVCoreMotion::calculateTurnPulses(float deg) {
+  // Arc length = (PI * wheelBase) * (degrees / 360)
+  return (long)((deg / 360.0f) * (PI * WHEEL_BASE_MM) / (PI * WHEEL_DIAMETER_MM) * (24 * 30) * TURN_CALIBRATION);
+}
+
+// State machine methods
+void AGVCoreMotion::updateForwardMovement() {
+  long l, r;
+  noInterrupts();
+  l = encL;
+  r = encR;
+  interrupts();
+  
+  long avgPulses = (l + r) / 2;
+  
+  // Check for timeout
+  if (millis() - movementStartTime > MOVEMENT_TIMEOUT) {
+    Serial.println(">> Forward timeout - emergency stopping");
+    emergencyStop();
+    return;
+  }
+  
+  // Check if we've reached the target
+  if (avgPulses >= targetPulses) {
+    stopRobot();
+    currentState = IDLE;
+    Serial.println(">> Forward completed");
+    
+    if (movementCallback) {
+      // Release mutex before callback to prevent deadlock
+      xSemaphoreGive(motionMutex);
+      movementCallback("FORWARD_COMPLETED");
+      xSemaphoreTake(motionMutex, portMAX_DELAY);
+    }
+    return;
+  }
+  
+  // Handle slowdown phase
+  if (avgPulses >= slowdownStart && currentState != FORWARD_SLOWING) {
+    currentState = FORWARD_SLOWING;
+  }
+  
+  if (currentState == FORWARD_SLOWING) {
+    float prog = (float)(avgPulses - slowdownStart) / max(1L, targetPulses - slowdownStart);
+    float speed = BASE_SPEED - (BASE_SPEED - FINAL_SPEED) * constrain(prog, 0, 1);
+    setMotorSpeeds(speed * LEFT_MOTOR_TRIM, speed * RIGHT_MOTOR_TRIM);
+  }
+}
+
+void AGVCoreMotion::updateTurnMovement() {
+  long l, r;
+  noInterrupts();
+  l = abs(encL);
+  r = abs(encR);
+  interrupts();
+  
+  long avgPulses = (l + r) / 2;
+  
+  // Check for timeout
+  if (millis() - movementStartTime > MOVEMENT_TIMEOUT) {
+    Serial.println(">> Turn timeout - emergency stopping");
+    emergencyStop();
+    return;
+  }
+  
+  // Check if we've reached the target
+  if (avgPulses >= targetPulses) {
+    stopRobot();
+    currentState = IDLE;
+    Serial.println(">> Turn completed");
+    
+    if (movementCallback) {
+      // Release mutex before callback to prevent deadlock
+      xSemaphoreGive(motionMutex);
+      movementCallback("TURN_COMPLETED");
+      xSemaphoreTake(motionMutex, portMAX_DELAY);
+    }
+    return;
+  }
+  
+  // Handle slowdown phase
+  if (avgPulses >= slowdownStart && currentState != TURN_SLOWING) {
+    currentState = TURN_SLOWING;
+  }
+  
+  if (currentState == TURN_SLOWING) {
+    float prog = (float)(avgPulses - slowdownStart) / max(1L, targetPulses - slowdownStart);
+    float speed = TURN_SPEED - (TURN_SPEED - FINAL_SPEED) * (prog * prog); // Quadratic slowdown
+    setMotorSpeeds(speed, speed);
+  }
+}
+
+// Direct movement commands
+void AGVCoreMotion::moveForward(float distanceMM) {
+  if (isInEmergency()) {
+    Serial.println(">> Cannot move: Emergency state active");
+    return;
+  }
+  
+  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) {
+    Serial.println(">> Failed to acquire motion mutex");
+    return;
+  }
+  
+  // Calculate movement parameters
+  targetPulses = calculateDistancePulses(distanceMM);
+  slowdownStart = (long)(targetPulses * 0.8f); // Start slowing at 80%
+  resetEncoders();
+  setDirection(true); // Forward
+  
+  // Apply motor trims and set initial speed
+  float leftSpeed = BASE_SPEED * LEFT_MOTOR_TRIM;
+  float rightSpeed = BASE_SPEED * RIGHT_MOTOR_TRIM;
+  setMotorSpeeds(leftSpeed, rightSpeed);
+  
+  movementStartTime = millis();
+  currentState = FORWARD_MOVING;
+  
+  Serial.printf(">> Starting forward movement (%.1fmm)\n", distanceMM);
+  
+  xSemaphoreGive(motionMutex);
+}
+
+void AGVCoreMotion::turnLeft(float degrees) {
+  if (isInEmergency()) {
+    Serial.println(">> Cannot turn: Emergency state active");
+    return;
+  }
+  
+  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) {
+    Serial.println(">> Failed to acquire motion mutex");
+    return;
+  }
+  
+  // Calculate movement parameters
+  targetPulses = calculateTurnPulses(degrees);
+  slowdownStart = (long)(targetPulses * 0.7f); // Start slowing at 70%
+  resetEncoders();
+  
+  // Set direction for left turn (left motor backward, right motor forward)
+  digitalWrite(BRK_L, LOW);
+  digitalWrite(BRK_R, LOW);
+  digitalWrite(DIR_L, LOW);  // Left motor backward
+  digitalWrite(DIR_R, HIGH); // Right motor forward
+  
+  // Set turn speed
+  setMotorSpeeds(TURN_SPEED, TURN_SPEED);
+  
+  movementStartTime = millis();
+  currentState = TURN_MOVING;
+  
+  Serial.printf(">> Starting left turn (%.1f°)\n", degrees);
+  
+  xSemaphoreGive(motionMutex);
+}
+
+void AGVCoreMotion::turnRight(float degrees) {
+  if (isInEmergency()) {
+    Serial.println(">> Cannot turn: Emergency state active");
+    return;
+  }
+  
+  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) {
+    Serial.println(">> Failed to acquire motion mutex");
+    return;
+  }
+  
+  // Calculate movement parameters
+  targetPulses = calculateTurnPulses(degrees);
+  slowdownStart = (long)(targetPulses * 0.7f); // Start slowing at 70%
+  resetEncoders();
+  
+  // Set direction for right turn (left motor forward, right motor backward)
+  digitalWrite(BRK_L, LOW);
+  digitalWrite(BRK_R, LOW);
+  digitalWrite(DIR_L, HIGH); // Left motor forward
+  digitalWrite(DIR_R, LOW);  // Right motor backward
+  
+  // Set turn speed
+  setMotorSpeeds(TURN_SPEED, TURN_SPEED);
+  
+  movementStartTime = millis();
+  currentState = TURN_MOVING;
+  
+  Serial.printf(">> Starting right turn (%.1f°)\n", degrees);
+  
+  xSemaphoreGive(motionMutex);
+}
+
+void AGVCoreMotion::turnAround() {
+  turnRight(360.0);
+}
+
+// Emergency handling
+void AGVCoreMotion::emergencyStop() {
+  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  stopRobot();
+  currentState = EMERGENCY_STOP;
+  
+  Serial.println("!!! EMERGENCY STOP ACTIVATED !!!");
+  
+  // Release mutex BEFORE callbacks to prevent deadlock
+  xSemaphoreGive(motionMutex);
+  
+  if (emergencyCallback) {
+    emergencyCallback();
+  }
+  
+  if (movementCallback) {
+    movementCallback("EMERGENCY_STOP");
+  }
+}
+
+void AGVCoreMotion::clearEmergency() {
+  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  if (currentState == EMERGENCY_STOP) {
+    currentState = IDLE;
+    Serial.println("[AGVMOTION] Emergency state cleared");
+  }
+  
+  // Release mutex BEFORE callbacks
+  xSemaphoreGive(motionMutex);
+  
+  if (movementCallback) {
+    movementCallback("SYSTEM_NORMAL");
+  }
+}
+
+// Command processing
+bool AGVCoreMotion::isValidCommand(const char* cmd) const {
+  if (!cmd || strlen(cmd) == 0) return false;
+  
+  String command = String(cmd);
+  command.trim();
+  command.toLowerCase();
+  
+  return (command.startsWith("move forward") ||
+          command.startsWith("turn_left") ||
+          command.startsWith("turn_right") ||
+          command.equalsIgnoreCase("turnaround") ||
+          command.equalsIgnoreCase("stop") ||
+          command.equalsIgnoreCase("clear_emergency"));
+}
+
+void AGVCoreMotion::processCommand(const char* cmd) {
+  if (!cmd || strlen(cmd) == 0) return;
+  
+  String command = String(cmd);
+  command.trim();
+  
+  Serial.printf("\n[MOTION] Processing command: '%s'\n", command.c_str());
+  
+  // Emergency commands have highest priority
+  if (command.equalsIgnoreCase("STOP") || command.equalsIgnoreCase("ABORT")) {
+    emergencyStop();
+    return;
+  }
+  
+  // Clear emergency state
+  if (command.equalsIgnoreCase("CLEAR_EMERGENCY")) {
+    clearEmergency();
+    return;
+  }
+  
+  // Only process valid commands
+  if (!isValidCommand(command.c_str())) {
+    Serial.printf("[MOTION] Invalid command: '%s'\n", command.c_str());
+    return;
+  }
+  
+  // Only process movement commands if not in emergency state
+  if (isInEmergency()) {
+    Serial.println("[MOTION] Command blocked: Emergency state active");
+    return;
+  }
+  
+  // Process command with mutex protection
+  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) {
+    Serial.println("[MOTION] Failed to acquire mutex for command");
+    return;
+  }
+  
+  // Move forward (default 1000mm)
+  if (command.equalsIgnoreCase("move forward")) {
+    moveForward(1000.0);
+    xSemaphoreGive(motionMutex);
+    return;
+  }
+  
+  // Turnaround (360 degrees)
+  if (command.equalsIgnoreCase("turnaround")) {
+    turnAround();
+    xSemaphoreGive(motionMutex);
+    return;
+  }
+  
+  // Turn left/right with angle parsing
+  if (command.startsWith("turn_left ") || command.startsWith("turn_right ")) {
+    bool isRight = command.startsWith("turn_right");
+    int spaceIndex = command.indexOf(' ');
+    String angleStr = command.substring(spaceIndex + 1);
+    float angle = angleStr.toFloat();
+    
+    if (angle > 0 && angle <= 360) {
+      xSemaphoreGive(motionMutex); // Release before movement
+      if (isRight) {
+        turnRight(angle);
+      } else {
+        turnLeft(angle);
+      }
+      return;
+    } else {
+      xSemaphoreGive(motionMutex);
+      Serial.println(">> Invalid angle (must be 1-360)");
+      return;
+    }
+  }
+  
+  xSemaphoreGive(motionMutex);
+  Serial.printf("[MOTION] Unhandled command: '%s'\n", command.c_str());
+}
+
+// Configuration methods
 void AGVCoreMotion::setWheelConfig(float wheelDiameterMM, float wheelBaseMM) {
   if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) == pdPASS) {
     WHEEL_DIAMETER_MM = wheelDiameterMM;
@@ -61,25 +548,25 @@ void AGVCoreMotion::setWheelConfig(float wheelDiameterMM, float wheelBaseMM) {
 
 void AGVCoreMotion::setSpeedConfig(float baseSpeed, float turnSpeed, float finalSpeed) {
   if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) == pdPASS) {
-    BASE_SPEED = baseSpeed;
-    TURN_SPEED = turnSpeed;
-    FINAL_SPEED = finalSpeed;
+    BASE_SPEED = constrain(baseSpeed, 20.0, 100.0);
+    TURN_SPEED = constrain(turnSpeed, 20.0, 100.0);
+    FINAL_SPEED = constrain(finalSpeed, 1.0, 20.0);
     xSemaphoreGive(motionMutex);
   }
 }
 
 void AGVCoreMotion::setCalibration(float linearCalibration, float turnCalibration) {
   if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) == pdPASS) {
-    LINEAR_CALIBRATION = linearCalibration;
-    TURN_CALIBRATION = turnCalibration;
+    LINEAR_CALIBRATION = constrain(linearCalibration, 0.5, 1.5);
+    TURN_CALIBRATION = constrain(turnCalibration, 0.5, 1.5);
     xSemaphoreGive(motionMutex);
   }
 }
 
 void AGVCoreMotion::setMotorTrim(float leftTrim, float rightTrim) {
   if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) == pdPASS) {
-    LEFT_MOTOR_TRIM = leftTrim;
-    RIGHT_MOTOR_TRIM = rightTrim;
+    LEFT_MOTOR_TRIM = constrain(leftTrim, 0.8, 1.2);
+    RIGHT_MOTOR_TRIM = constrain(rightTrim, 0.8, 1.2);
     xSemaphoreGive(motionMutex);
   }
 }
@@ -98,489 +585,4 @@ void AGVCoreMotion::setEmergencyCallback(EmergencyCallback callback) {
     xSemaphoreGive(motionMutex);
     Serial.println("[AGVMOTION] Emergency callback registered");
   }
-}
-
-void AGVCoreMotion::emergencyStop() {
-  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-  
-  stopRobot();
-  currentState = EMERGENCY_STOP;
-  currentPathState = PATH_IDLE;
-  
-  Serial.println("!!! EMERGENCY STOP ACTIVATED !!!");
-  
-  if (movementCallback) {
-    movementCallback("EMERGENCY_STOP");
-  }
-  
-  xSemaphoreGive(motionMutex);
-}
-
-void AGVCoreMotion::executePath(int sourceX, int sourceY, int destX, int destY, bool loopMode, int loopCount) {
-  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-  
-  currentSourceX = sourceX;
-  currentSourceY = sourceY;
-  currentDestX = destX;
-  currentDestY = destY;
-  this->loopMode = loopMode;
-  this->loopCount = loopCount;
-  currentLoop = 0;
-  currentPathState = PATH_EXECUTING;
-  
-  Serial.printf("[PATH] Starting path: (%d,%d) to (%d,%d)%s\n",
-                sourceX, sourceY, destX, destY,
-                loopMode ? String(" (loop " + String(loopCount) + " times)").c_str() : "");
-  
-  if (movementCallback) {
-    movementCallback("PATH_STARTED");
-  }
-  
-  xSemaphoreGive(motionMutex);
-}
-
-void AGVCoreMotion::initHardware() {
-  // Initialize pins
-  pinMode(SPD_L, INPUT_PULLUP);
-  pinMode(SPD_R, INPUT_PULLUP);
-  pinMode(DIR_L, OUTPUT);
-  pinMode(DIR_R, OUTPUT);
-  pinMode(BRK_L, OUTPUT);
-  pinMode(BRK_R, OUTPUT);
-  
-  // Attach interrupts
-  attachInterrupt(digitalPinToInterrupt(SPD_L), isrLeftWrapper, RISING);
-  attachInterrupt(digitalPinToInterrupt(SPD_R), isrRightWrapper, RISING);
-  
-  // Setup PWM
-  setupPWM();
-  
-  // Initial stop
-  stopRobot();
-  
-  Serial.println("[AGVMOTION] ✅ Hardware initialized");
-  Serial.println("[AGVMOTION] Supported commands:");
-  Serial.println("  move forward");
-  Serial.println("  turnaround");
-  Serial.println("  turn_left 90");
-  Serial.println("  turn_right 90");
-  Serial.println("  STOP/ABORT (emergency)");
-  Serial.println("  PATH:sx,sy,dx,dy:MODE[:count] (from web)");
-}
-
-void AGVCoreMotion::setupPWM() {
-  ledc_timer_config_t timer = {
-    .speed_mode = LEDC_LOW_SPEED_MODE,
-    .duty_resolution = LEDC_TIMER_12_BIT,
-    .timer_num = LEDC_TIMER_0,
-    .freq_hz = 2000,
-    .clk_cfg = LEDC_AUTO_CLK
-  };
-  ledc_timer_config(&timer);
-
-  ledc_channel_config_t ch = {
-    .gpio_num = PWM_L, .speed_mode = LEDC_LOW_SPEED_MODE,
-    .channel = LEDC_CHANNEL_0, .intr_type = LEDC_INTR_DISABLE,
-    .timer_sel = LEDC_TIMER_0, .duty = 0, .hpoint = 0
-  };
-  ledc_channel_config(&ch);
-
-  ch.gpio_num = PWM_R;
-  ch.channel = LEDC_CHANNEL_1;
-  ledc_channel_config(&ch);
-}
-
-void AGVCoreMotion::core1Task(void *parameter) {
-  Serial.println("[CORE1] AGV Motion task started on Core 1");
-  
-  while(1) {
-    if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(10)) == pdPASS) {
-      // Process path execution
-      if (currentPathState == PATH_EXECUTING || currentPathState == PATH_LOOPING) {
-        executePathSegment();
-      }
-      
-      // Update current movement state
-      switch(currentState) {
-        case FORWARD_MOVING:
-        case FORWARD_SLOWING:
-          updateForwardMovement();
-          break;
-          
-        case TURN_MOVING:
-        case TURN_SLOWING:
-          updateTurnMovement();
-          break;
-          
-        case EMERGENCY_STOP:
-          currentState = IDLE;
-          break;
-      }
-      
-      xSemaphoreGive(motionMutex);
-    }
-    
-    delay(5);  // Small delay for responsiveness
-  }
-}
-
-// Motor control methods
-void AGVCoreMotion::setMotorSpeeds(float left, float right) {
-  left = constrain(left, 0, 100);
-  right = constrain(right, 0, 100);
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, (uint32_t)(left / 100.0f * 4095));
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, (uint32_t)(right / 100.0f * 4095));
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-}
-
-void AGVCoreMotion::stopRobot() {
-  digitalWrite(BRK_L, HIGH);
-  digitalWrite(BRK_R, HIGH);
-  setMotorSpeeds(0, 0);
-  inTurn = false;
-}
-
-void AGVCoreMotion::setDirection(bool forward) {
-  digitalWrite(BRK_L, LOW);
-  digitalWrite(BRK_R, LOW);
-  digitalWrite(DIR_L, forward ? HIGH : LOW);
-  digitalWrite(DIR_R, forward ? HIGH : LOW);
-}
-
-void AGVCoreMotion::resetEncoders() {
-  noInterrupts();
-  encL = encR = 0;
-  interrupts();
-}
-
-// Calculation methods
-long AGVCoreMotion::calculateDistancePulses(float mm) {
-  return (long)((mm / (PI * WHEEL_DIAMETER_MM)) * (24 * 30) * LINEAR_CALIBRATION);
-}
-
-long AGVCoreMotion::calculateTurnPulses(float deg) {
-  float arc = (PI * WHEEL_BASE_MM) * (deg / 360.0f);
-  return (long)((arc / (PI * WHEEL_DIAMETER_MM)) * (24 * 30) * TURN_CALIBRATION);
-}
-
-float AGVCoreMotion::calculateRequiredTurn(int sourceX, int sourceY, int destX, int destY) {
-  // Calculate angle needed to face destination
-  if (sourceX == destX && sourceY == destY) return 0.0;
-  
-  float dx = destX - sourceX;
-  float dy = destY - sourceY;
-  float angle = atan2(dy, dx) * 180.0 / PI;
-  
-  // Convert to 0-360 range
-  if (angle < 0) angle += 360.0;
-  
-  return angle;
-}
-
-bool AGVCoreMotion::calculateNextMovement() {
-  // This is a simplified version - in a real AGV you'd need full path planning
-  // For now, we'll just move in X then Y direction
-  
-  if (currentSourceX == currentDestX && currentSourceY == currentDestY) {
-    return false; // Reached destination
-  }
-  
-  // Move along X axis first
-  if (currentSourceX != currentDestX) {
-    int direction = (currentSourceX < currentDestX) ? 1 : -1;
-    float distanceMM = abs(currentDestX - currentSourceX) * 1000.0; // Assuming 1 unit = 1 meter
-    
-    // For now, we just move forward - real implementation would handle turns
-    return true;
-  }
-  
-  // Then move along Y axis
-  if (currentSourceY != currentDestY) {
-    int direction = (currentSourceY < currentDestY) ? 1 : -1;
-    float distanceMM = abs(currentDestY - currentSourceY) * 1000.0;
-    
-    return true;
-  }
-  
-  return false;
-}
-
-// State machine methods
-void AGVCoreMotion::updateForwardMovement() {
-  long l, r;
-  noInterrupts();
-  l = encL;
-  r = encR;
-  interrupts();
-  
-  long avgPulses = (l + r) / 2;
-  
-  // Check for timeout
-  if (millis() - movementStartTime > FORWARD_TIMEOUT) {
-    Serial.println(">> Forward timeout - stopping");
-    stopRobot();
-    currentState = IDLE;
-    return;
-  }
-  
-  // Check if we've reached the target
-  if (avgPulses >= targetPulses) {
-    stopRobot();
-    currentState = IDLE;
-    Serial.println(">> Forward completed");
-    
-    if (movementCallback) {
-      movementCallback("FORWARD_COMPLETED");
-    }
-    return;
-  }
-  
-  // Handle slowdown phase
-  if (avgPulses >= slowdownStart) {
-    float prog = (float)(avgPulses - slowdownStart) / max(1L, targetPulses - slowdownStart);
-    float speed = BASE_SPEED - (BASE_SPEED - FINAL_SPEED) * constrain(prog, 0, 1);
-    setMotorSpeeds(speed * LEFT_MOTOR_TRIM, speed * RIGHT_MOTOR_TRIM);
-  }
-}
-
-void AGVCoreMotion::updateTurnMovement() {
-  long l, r;
-  noInterrupts();
-  l = abs(encL);
-  r = abs(encR);
-  interrupts();
-  
-  long avgPulses = (l + r) / 2;
-  
-  // Check for timeout
-  if (millis() - movementStartTime > TURN_TIMEOUT) {
-    Serial.println(">> Turn timeout - stopping");
-    stopRobot();
-    inTurn = false;
-    currentState = IDLE;
-    return;
-  }
-  
-  // Check if we've reached the target
-  if (avgPulses >= targetPulses) {
-    stopRobot();
-    inTurn = false;
-    currentState = IDLE;
-    Serial.println(">> Turn completed");
-    
-    if (movementCallback) {
-      movementCallback("TURN_COMPLETED");
-    }
-    return;
-  }
-  
-  // Handle slowdown phase
-  if (avgPulses >= slowdownStart) {
-    float prog = (float)(avgPulses - slowdownStart) / max(1L, targetPulses - slowdownStart);
-    float speed = TURN_SPEED - (TURN_SPEED - FINAL_SPEED) * (prog * prog);
-    setMotorSpeeds(speed, speed);
-  }
-}
-
-void AGVCoreMotion::executePathSegment() {
-  if (currentState != IDLE) return; // Wait for current movement to finish
-  
-  if (currentPathState == PATH_EXECUTING) {
-    // Simple path execution: move forward 1000mm as test
-    targetPulses = calculateDistancePulses(1000.0);
-    slowdownStart = (long)(targetPulses * 0.8f);
-    resetEncoders();
-    setDirection(true);
-    setMotorSpeeds(BASE_SPEED * LEFT_MOTOR_TRIM, BASE_SPEED * RIGHT_MOTOR_TRIM);
-    movementStartTime = millis();
-    currentState = FORWARD_MOVING;
-    
-    Serial.println(">> Path segment: Moving forward 1000mm");
-    
-    currentPathState = PATH_IDLE; // For now, just one segment
-  }
-  
-  // Handle loop completion
-  if (loopMode && currentLoop >= loopCount) {
-    currentPathState = PATH_IDLE;
-    loopMode = false;
-    Serial.printf(">> Path loop completed (%d iterations)\n", loopCount);
-    
-    if (movementCallback) {
-      movementCallback("PATH_COMPLETED");
-    }
-  }
-}
-
-// Command processing
-void AGVCoreMotion::processCommand(const char* cmd, uint8_t source, uint8_t priority) {
-  if (xSemaphoreTake(motionMutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-  
-  String command = String(cmd);
-  command.trim();
-  
-  Serial.printf("\n[MOTION] Command received: '%s' (source=%d, priority=%d)\n", 
-                command.c_str(), source, priority);
-  
-  // Emergency commands have highest priority
-  if (priority == 1 && (command.equalsIgnoreCase("STOP") || command.equalsIgnoreCase("ABORT"))) {
-    emergencyStop();
-    
-    if (emergencyCallback) {
-      emergencyCallback();
-    }
-    
-    xSemaphoreGive(motionMutex);
-    return;
-  }
-  
-  // Only process relevant commands
-  if (isValidMovementCommand(command.c_str())) {
-    parseAndExecuteCommand(command.c_str());
-  } else {
-    Serial.printf("[MOTION] Ignoring irrelevant command: '%s'\n", command.c_str());
-  }
-  
-  xSemaphoreGive(motionMutex);
-}
-
-bool AGVCoreMotion::isValidMovementCommand(const char* cmd) {
-  String command = String(cmd);
-  command.trim();
-  command.toLowerCase();
-  
-  // Check for movement commands
-  if (command.startsWith("move forward") ||
-      command.startsWith("turn_left") ||
-      command.startsWith("turn_right") ||
-      command.startsWith("turnaround") ||
-      command.equalsIgnoreCase("stop") ||
-      command.equalsIgnoreCase("abort") ||
-      command.startsWith("path:")) {
-    return true;
-  }
-  
-  // Check for emergency commands
-  if (command.startsWith("emergency") || command.startsWith("!!!")) {
-    return true;
-  }
-  
-  return false;
-}
-
-void AGVCoreMotion::parseAndExecuteCommand(const char* cmd) {
-  String command = String(cmd);
-  command.trim();
-  
-  // Emergency stop
-  if (command.equalsIgnoreCase("STOP") || command.equalsIgnoreCase("ABORT")) {
-    emergencyStop();
-    return;
-  }
-  
-  // Move forward
-  if (command.equalsIgnoreCase("move forward")) {
-    targetPulses = calculateDistancePulses(1000.0); // Default 1000mm
-    slowdownStart = (long)(targetPulses * 0.8f);
-    resetEncoders();
-    setDirection(true);
-    setMotorSpeeds(BASE_SPEED * LEFT_MOTOR_TRIM, BASE_SPEED * RIGHT_MOTOR_TRIM);
-    movementStartTime = millis();
-    currentState = FORWARD_MOVING;
-    Serial.println(">> Starting forward movement (1000mm)");
-    return;
-  }
-  
-  // Turnaround (360 degrees)
-  if (command.equalsIgnoreCase("turnaround")) {
-    targetPulses = calculateTurnPulses(360.0);
-    slowdownStart = (long)(targetPulses * 0.6f);
-    resetEncoders();
-    inTurn = true;
-    digitalWrite(BRK_L, LOW);
-    digitalWrite(BRK_R, LOW);
-    digitalWrite(DIR_L, HIGH); // Right turn
-    digitalWrite(DIR_R, LOW);
-    setMotorSpeeds(TURN_SPEED, TURN_SPEED);
-    movementStartTime = millis();
-    currentState = TURN_MOVING;
-    Serial.println(">> Starting 360° turn");
-    return;
-  }
-  
-  // Turn left/right
-  if (command.startsWith("turn_left ") || command.startsWith("turn_right ")) {
-    bool isRight = command.startsWith("turn_right");
-    int spaceIndex = command.indexOf(' ');
-    String angleStr = command.substring(spaceIndex + 1);
-    int angle = angleStr.toInt();
-    
-    if (angle > 0 && angle <= 360) {
-      targetPulses = calculateTurnPulses(abs(angle));
-      slowdownStart = (long)(targetPulses * 0.6f);
-      resetEncoders();
-      inTurn = true;
-      digitalWrite(BRK_L, LOW);
-      digitalWrite(BRK_R, LOW);
-      digitalWrite(DIR_L, isRight ? HIGH : LOW);
-      digitalWrite(DIR_R, isRight ? LOW : HIGH);
-      setMotorSpeeds(TURN_SPEED, TURN_SPEED);
-      movementStartTime = millis();
-      currentState = TURN_MOVING;
-      Serial.printf(">> Starting %s turn (%d°)\n", isRight ? "right" : "left", angle);
-    } else {
-      Serial.println(">> Invalid angle (must be 1-360)");
-    }
-    return;
-  }
-  
-  // Path command from web interface
-  if (command.startsWith("PATH:")) {
-    // Format: PATH:sx,sy,dx,dy:MODE[:count]
-    // Example: PATH:1,1,3,2:ONCE or PATH:1,1,3,2:LOOP:5
-    
-    int firstColon = command.indexOf(':');
-    int secondColon = command.indexOf(':', firstColon + 1);
-    
-    if (secondColon == -1) {
-      Serial.println(">> Invalid PATH command format");
-      return;
-    }
-    
-    String coords = command.substring(firstColon + 1, secondColon);
-    String modePart = command.substring(secondColon + 1);
-    
-    // Parse coordinates
-    int comma1 = coords.indexOf(',');
-    int comma2 = coords.indexOf(',', comma1 + 1);
-    int comma3 = coords.indexOf(',', comma2 + 1);
-    
-    if (comma3 == -1) {
-      Serial.println(">> Invalid coordinate format in PATH command");
-      return;
-    }
-    
-    int sourceX = coords.substring(0, comma1).toInt();
-    int sourceY = coords.substring(comma1 + 1, comma2).toInt();
-    int destX = coords.substring(comma2 + 1, comma3).toInt();
-    int destY = coords.substring(comma3 + 1).toInt();
-    
-    // Parse mode
-    bool loopMode = false;
-    int loopCount = 1;
-    
-    if (modePart.startsWith("LOOP")) {
-      loopMode = true;
-      int thirdColon = modePart.indexOf(':');
-      if (thirdColon != -1) {
-        loopCount = modePart.substring(thirdColon + 1).toInt();
-      }
-    }
-    
-    executePath(sourceX, sourceY, destX, destY, loopMode, loopCount);
-    return;
-  }
-  
-  Serial.printf(">> Unknown command: '%s'\n", command.c_str());
 }
