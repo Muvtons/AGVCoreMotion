@@ -5,39 +5,32 @@
 #include <driver/ledc.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <freertos/queue.h>
 #include <freertos/semphr.h>
 
-// Unique library namespace to prevent conflicts
 namespace AGVCoreMotionLib {
 
 // Movement states for state machine
 enum MovementState {
   IDLE,
-  FORWARD_START,
   FORWARD_MOVING,
   FORWARD_SLOWING,
-  TURN_START,
   TURN_MOVING,
   TURN_SLOWING,
   EMERGENCY_STOP
 };
 
-// Path execution states
-enum PathState {
-  PATH_IDLE,
-  PATH_EXECUTING,
-  PATH_LOOPING
-};
-
+// Simplified - removed path states since we're using direct commands only
 class AGVCoreMotion {
 public:
   // Callback function types
   typedef void (*MovementCallback)(const char* status);
   typedef void (*EmergencyCallback)();
   
-  // Initialize the motion system - 1 of 4 lines
-  void begin();
+  // Initialize the motion system - FIXED SIGNATURE
+  void begin(uint8_t spdLeftPin = 4, uint8_t spdRightPin = 5,
+             uint8_t pwmLeftPin = 6, uint8_t pwmRightPin = 7,
+             uint8_t dirLeftPin = 15, uint8_t dirRightPin = 16,
+             uint8_t brkLeftPin = 17, uint8_t brkRightPin = 18);
   
   // Configure robot parameters - optional but recommended
   void setWheelConfig(float wheelDiameterMM = 200.0, float wheelBaseMM = 600.0);
@@ -49,20 +42,25 @@ public:
   void setMovementCallback(MovementCallback callback);
   void setEmergencyCallback(EmergencyCallback callback);
   
-  // Emergency stop (highest priority)
+  // Emergency stop (highest priority) and recovery
   void emergencyStop();
+  void clearEmergency();
+  bool isInEmergency() const { return currentState == EMERGENCY_STOP; }
   
-  // Path execution (from web interface)
-  void executePath(int sourceX, int sourceY, int destX, int destY, bool loopMode = false, int loopCount = 1);
+  // Process command from serial interface - SIMPLIFIED
+  void processCommand(const char* cmd);
   
-  // Process command from Core 0 - NOW PUBLIC
-  void processCommand(const char* cmd, uint8_t source, uint8_t priority);
-  
-  // Library handles everything else automatically on Core 1
-  void loop(); // Called automatically in background task
+  // Direct movement commands (for internal use)
+  void moveForward(float distanceMM = 1000.0);
+  void turnLeft(float degrees = 90.0);
+  void turnRight(float degrees = 90.0);
+  void turnAround();
 
 private:
-  // Hardware configuration
+  // Hardware pins - now configurable
+  uint8_t SPD_L, SPD_R, PWM_L, PWM_R, DIR_L, DIR_R, BRK_L, BRK_R;
+  
+  // Robot configuration
   float WHEEL_DIAMETER_MM;
   float WHEEL_BASE_MM;
   float BASE_SPEED;
@@ -73,38 +71,16 @@ private:
   float LEFT_MOTOR_TRIM;
   float RIGHT_MOTOR_TRIM;
   
-  // Hardware pins
-  const uint8_t SPD_L = 4;
-  const uint8_t SPD_R = 5;
-  const uint8_t PWM_L = 6;
-  const uint8_t PWM_R = 7;
-  const uint8_t DIR_L = 15;
-  const uint8_t DIR_R = 16;
-  const uint8_t BRK_L = 17;
-  const uint8_t BRK_R = 18;
-  
   // Movement state
   volatile long encL = 0;
   volatile long encR = 0;
-  volatile bool inTurn = false;
   MovementState currentState = IDLE;
-  PathState currentPathState = PATH_IDLE;
-  
-  // Path execution variables
-  int currentSourceX = 1;
-  int currentSourceY = 1;
-  int currentDestX = 1;
-  int currentDestY = 1;
-  bool loopMode = false;
-  int loopCount = 1;
-  int currentLoop = 0;
   
   // Timing and targets
   long targetPulses = 0;
   long slowdownStart = 0;
   unsigned long movementStartTime = 0;
-  const unsigned long FORWARD_TIMEOUT = 10000;
-  const unsigned long TURN_TIMEOUT = 15000;
+  static constexpr unsigned long MOVEMENT_TIMEOUT = 15000; // 15 seconds max
   
   // Callbacks
   MovementCallback movementCallback = nullptr;
@@ -122,8 +98,8 @@ private:
   // ISR methods
   static void IRAM_ATTR isrLeftWrapper();
   static void IRAM_ATTR isrRightWrapper();
-  void isrLeft() { encL++; }
-  void isrRight() { encR++; }
+  void IRAM_ATTR isrLeft() { encL++; }
+  void IRAM_ATTR isrRight() { encR++; }
   
   // Motor control
   void setMotorSpeeds(float left, float right);
@@ -134,17 +110,13 @@ private:
   // Calculation methods
   long calculateDistancePulses(float mm);
   long calculateTurnPulses(float deg);
-  float calculateRequiredTurn(int sourceX, int sourceY, int destX, int destY);
-  bool calculateNextMovement();
   
   // State machine methods
   void updateForwardMovement();
   void updateTurnMovement();
-  void executePathSegment();
   
-  // Command processing (internal helpers)
-  bool isValidMovementCommand(const char* cmd);
-  void parseAndExecuteCommand(const char* cmd);
+  // Command validation
+  bool isValidCommand(const char* cmd) const;
 };
 
 } // namespace AGVCoreMotionLib
